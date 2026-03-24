@@ -23,13 +23,13 @@ name = "miniz_oxide_c_api"
 #CRATE_TYPE
 
 [dependencies]
-cc = "1.0.83"
-libc = "0.2.22"
+cc = "1.2.57"
+libc = "0.2.183"
 crc32fast = "1.2.0"
 miniz_oxide = { path = "miniz_oxide", version = "0.9.0" }
 
 [build-dependencies]
-cc = "1.0"
+cc = "1.2.57"
 
 [features]
 default = []
