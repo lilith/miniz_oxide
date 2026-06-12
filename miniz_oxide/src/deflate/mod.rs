@@ -144,6 +144,70 @@ pub fn compress_to_vec_zlib(input: &[u8], level: u8) -> Vec<u8> {
     compress_to_vec_inner(input, level, 1, 0)
 }
 
+/// Compress the input data to a vector, using the specified compression level
+/// (0-10) and an optional zlib wrapper, polling `stop` about every 64 KiB of
+/// consumed input.
+///
+/// If `stop` signals a stop, compression ends early with the [`StopReason`][enough::StopReason]
+/// and the data compressed so far is discarded.
+///
+/// Passing [`enough::Unstoppable`] never stops and produces the same output as
+/// [`compress_to_vec`] / [`compress_to_vec_zlib`].
+#[cfg(feature = "enough")]
+pub fn compress_to_vec_with_stop(
+    input: &[u8],
+    level: u8,
+    zlib_wrapper: bool,
+    stop: &dyn enough::Stop,
+) -> Result<Vec<u8>, enough::StopReason> {
+    // The comp flags function sets the zlib flag if the window_bits parameter is > 0.
+    let flags = create_comp_flags_from_zip_params(level.into(), i32::from(zlib_wrapper), 0);
+    let mut compressor = CompressorOxide::new(flags);
+    let mut output = vec![0; ::core::cmp::max(input.len() / 2, 2)];
+
+    // Compression has no output amplification, so feeding the streaming
+    // compressor bounded input chunks bounds the work between polls. Block
+    // emission is driven by the compressor's internal buffers, not call
+    // boundaries, so the output matches the one-shot functions.
+    const STOP_CHUNK: usize = 64 * 1024;
+
+    let mut in_pos = 0;
+    let mut out_pos = 0;
+    loop {
+        stop.check()?;
+
+        let chunk_end = ::core::cmp::min(in_pos + STOP_CHUNK, input.len());
+        let last = chunk_end == input.len();
+        let (status, bytes_in, bytes_out) = compress(
+            &mut compressor,
+            &input[in_pos..chunk_end],
+            &mut output[out_pos..],
+            if last {
+                TDEFLFlush::Finish
+            } else {
+                TDEFLFlush::None
+            },
+        );
+        in_pos += bytes_in;
+        out_pos += bytes_out;
+
+        match status {
+            TDEFLStatus::Done => {
+                output.truncate(out_pos);
+                return Ok(output);
+            }
+            TDEFLStatus::Okay => {
+                // We may need more space, so resize the vector.
+                if output.len().saturating_sub(out_pos) < 30 {
+                    output.resize(output.len() * 2, 0)
+                }
+            }
+            // Not supposed to happen unless there is a bug.
+            _ => panic!("Bug! Unexpectedly failed to compress!"),
+        }
+    }
+}
+
 /// Simple function to compress data to a vec.
 fn compress_to_vec_inner(mut input: &[u8], level: u8, window_bits: i32, strategy: i32) -> Vec<u8> {
     // The comp flags function sets the zlib flag if the window_bits parameter is > 0.
@@ -258,5 +322,54 @@ mod test {
         // (The optimal compressed length would be 5, but neither miniz nor zlib manages that either
         // as neither checks matches against the byte at index 0.)
         assert!(c.len() <= 6);
+    }
+
+    #[cfg(feature = "enough")]
+    mod stop {
+        use crate::deflate::{compress_to_vec_with_stop, compress_to_vec_zlib};
+        use alloc::vec::Vec;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Stops after `n` checks have returned Ok.
+        struct StopAfter(AtomicUsize);
+
+        impl enough::Stop for StopAfter {
+            fn check(&self) -> Result<(), enough::StopReason> {
+                if self.0.load(Ordering::Relaxed) == 0 {
+                    Err(enough::StopReason::Cancelled)
+                } else {
+                    self.0.fetch_sub(1, Ordering::Relaxed);
+                    Ok(())
+                }
+            }
+        }
+
+        /// Spans several 64 KiB poll chunks.
+        fn payload() -> Vec<u8> {
+            (0..512 * 1024).map(|i| (i % 251) as u8).collect()
+        }
+
+        #[test]
+        fn never_stopping_matches_plain_compress() {
+            let raw = payload();
+            let plain = compress_to_vec_zlib(&raw, 6);
+            let with_stop = compress_to_vec_with_stop(&raw, 6, true, &enough::Unstoppable).unwrap();
+            assert_eq!(plain, with_stop);
+        }
+
+        #[test]
+        fn stopping_returns_stop_reason() {
+            let raw = payload();
+            for checks_allowed in [0, 2] {
+                let err = compress_to_vec_with_stop(
+                    &raw,
+                    6,
+                    true,
+                    &StopAfter(AtomicUsize::new(checks_allowed)),
+                )
+                .unwrap_err();
+                assert!(matches!(err, enough::StopReason::Cancelled));
+            }
+        }
     }
 }

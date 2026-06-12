@@ -12,6 +12,7 @@ pub mod stream;
 #[cfg(not(feature = "rustc-dep-of-std"))]
 use self::core::*;
 
+const TINFL_STATUS_STOPPED: i32 = -5;
 const TINFL_STATUS_FAILED_CANNOT_MAKE_PROGRESS: i32 = -4;
 const TINFL_STATUS_BAD_PARAM: i32 = -3;
 const TINFL_STATUS_ADLER32_MISMATCH: i32 = -2;
@@ -28,6 +29,11 @@ const TINFL_STATUS_BLOCK_BOUNDARY: i32 = 3;
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TINFLStatus {
+    /// Decompression was stopped early by the stop callback.
+    ///
+    /// The data decompressed so far is valid.
+    Stopped = TINFL_STATUS_STOPPED as i8,
+
     /// More input data was expected, but the caller indicated that there was no more data, so the
     /// input stream is likely truncated.
     ///
@@ -83,6 +89,7 @@ impl TINFLStatus {
     pub fn from_i32(value: i32) -> Option<TINFLStatus> {
         use self::TINFLStatus::*;
         match value {
+            TINFL_STATUS_STOPPED => Some(Stopped),
             TINFL_STATUS_FAILED_CANNOT_MAKE_PROGRESS => Some(FailedCannotMakeProgress),
             TINFL_STATUS_BAD_PARAM => Some(BadParam),
             TINFL_STATUS_ADLER32_MISMATCH => Some(Adler32Mismatch),
@@ -112,6 +119,7 @@ impl alloc::fmt::Display for DecompressError {
     #[cold]
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         f.write_str(match self.status {
+            TINFLStatus::Stopped => "Stopped by cancellation callback",
             TINFLStatus::FailedCannotMakeProgress => "Truncated input stream",
             TINFLStatus::BadParam => "Invalid output buffer size",
             TINFLStatus::Adler32Mismatch => "Adler32 checksum mismatch",
@@ -144,7 +152,7 @@ fn decompress_error(status: TINFLStatus, output: Vec<u8>) -> Result<Vec<u8>, Dec
 #[inline]
 #[cfg(feature = "with-alloc")]
 pub fn decompress_to_vec(input: &[u8]) -> Result<Vec<u8>, DecompressError> {
-    decompress_to_vec_inner(input, 0, usize::MAX)
+    decompress_to_vec_inner(input, 0, usize::MAX, None)
 }
 
 /// Decompress the deflate-encoded data (with a zlib wrapper) in `input` to a vector.
@@ -161,6 +169,7 @@ pub fn decompress_to_vec_zlib(input: &[u8]) -> Result<Vec<u8>, DecompressError> 
         input,
         inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER,
         usize::MAX,
+        None,
     )
 }
 
@@ -179,7 +188,7 @@ pub fn decompress_to_vec_with_limit(
     input: &[u8],
     max_size: usize,
 ) -> Result<Vec<u8>, DecompressError> {
-    decompress_to_vec_inner(input, 0, max_size)
+    decompress_to_vec_inner(input, 0, max_size, None)
 }
 
 /// Decompress the deflate-encoded data (with a zlib wrapper) in `input` to a vector.
@@ -196,7 +205,46 @@ pub fn decompress_to_vec_zlib_with_limit(
     input: &[u8],
     max_size: usize,
 ) -> Result<Vec<u8>, DecompressError> {
-    decompress_to_vec_inner(input, inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER, max_size)
+    decompress_to_vec_inner(
+        input,
+        inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER,
+        max_size,
+        None,
+    )
+}
+
+/// Decompress deflate-encoded data (with an optional zlib wrapper) to a vector,
+/// polling `stop` at each deflate block boundary and roughly every 16 KiB of
+/// decompressed output.
+///
+/// If `stop` signals a stop, decompression ends early and the returned
+/// [`DecompressError`] has the status [`TINFLStatus::Stopped`] and holds the data
+/// decompressed so far.
+///
+/// Passing [`enough::Unstoppable`] (or any `Stop` whose `may_stop()` returns
+/// false) installs no callback and takes the same code path as
+/// [`decompress_to_vec_with_limit`].
+#[inline]
+#[cfg(all(feature = "with-alloc", feature = "enough"))]
+pub fn decompress_to_vec_with_stop(
+    input: &[u8],
+    zlib_header: bool,
+    max_size: usize,
+    stop: &dyn enough::Stop,
+) -> Result<Vec<u8>, DecompressError> {
+    let flags = if zlib_header {
+        inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+    } else {
+        0
+    };
+    let callback;
+    let stop = if stop.may_stop() {
+        callback = || stop.should_stop();
+        Some(&callback as &dyn Fn() -> bool)
+    } else {
+        None
+    };
+    decompress_to_vec_inner(input, flags, max_size, stop)
 }
 
 /// Backend of various to-[`Vec`] decompressions.
@@ -207,6 +255,7 @@ fn decompress_to_vec_inner(
     mut input: &[u8],
     flags: u32,
     max_output_size: usize,
+    stop: Option<&dyn Fn() -> bool>,
 ) -> Result<Vec<u8>, DecompressError> {
     let flags = flags | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
     let mut ret: Vec<u8> = vec![0; input.len().saturating_mul(2).min(max_output_size)];
@@ -217,8 +266,15 @@ fn decompress_to_vec_inner(
     loop {
         // Wrap the whole output slice so we know we have enough of the
         // decompressed data for matches.
-        let (status, in_consumed, out_consumed) =
-            decompress(&mut decomp, input, &mut ret, out_pos, flags);
+        let (status, in_consumed, out_consumed) = decompress_internal(
+            &mut decomp,
+            input,
+            &mut ret,
+            out_pos,
+            usize::MAX,
+            flags,
+            stop,
+        );
         out_pos += out_consumed;
 
         match status {
@@ -387,5 +443,62 @@ mod test {
         let mut out = [0_u8; 3_usize];
         let r = decompress_slice_iter_to_slice(&mut out, ENCODED.chunks(7), true, false);
         assert!(r.is_err());
+    }
+
+    #[cfg(feature = "enough")]
+    mod stop {
+        use crate::alloc::vec::Vec;
+        use crate::deflate::compress_to_vec_zlib;
+        use crate::inflate::{decompress_to_vec_with_stop, TINFLStatus};
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Stops after `n` checks have returned Ok.
+        struct StopAfter(AtomicUsize);
+
+        impl enough::Stop for StopAfter {
+            fn check(&self) -> Result<(), enough::StopReason> {
+                if self.0.load(Ordering::Relaxed) == 0 {
+                    Err(enough::StopReason::Cancelled)
+                } else {
+                    self.0.fetch_sub(1, Ordering::Relaxed);
+                    Ok(())
+                }
+            }
+        }
+
+        /// Compressible data spanning multiple deflate blocks and many 16 KiB
+        /// poll intervals.
+        fn payload() -> (Vec<u8>, Vec<u8>) {
+            let raw: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+            let compressed = compress_to_vec_zlib(&raw, 6);
+            (raw, compressed)
+        }
+
+        #[test]
+        fn never_stopping_matches_plain_decompress() {
+            let (raw, compressed) = payload();
+            assert_eq!(
+                decompress_to_vec_with_stop(&compressed, true, usize::MAX, &enough::Unstoppable)
+                    .unwrap(),
+                raw
+            );
+            let generous = StopAfter(AtomicUsize::new(usize::MAX));
+            assert_eq!(
+                decompress_to_vec_with_stop(&compressed, true, usize::MAX, &generous).unwrap(),
+                raw
+            );
+        }
+
+        #[test]
+        fn stopping_returns_stopped_status() {
+            let (raw, compressed) = payload();
+            for checks_allowed in [0, 2] {
+                let stop = StopAfter(AtomicUsize::new(checks_allowed));
+                let err =
+                    decompress_to_vec_with_stop(&compressed, true, usize::MAX, &stop).unwrap_err();
+                assert_eq!(err.status, TINFLStatus::Stopped);
+                assert!(err.output.len() < raw.len());
+            }
+        }
     }
 }
