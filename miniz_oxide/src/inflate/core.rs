@@ -1209,6 +1209,48 @@ fn apply_match(
     }
 }
 
+/// How often, in output bytes, the cancel check is polled in the fast
+/// decompression loop. 16 KiB keeps polling in the tens of microseconds at
+/// typical decompression speeds while staying off the per-symbol hot path.
+const CANCEL_CHECK_INTERVAL: usize = 16 * 1024;
+
+/// A throttled poller for the optional cancel check: it consults the check at
+/// most once per [`CANCEL_CHECK_INTERVAL`] output bytes, and is a single
+/// never-taken comparison when no check is set.
+struct CancelPoll<'a> {
+    check: Option<&'a dyn Fn() -> bool>,
+    /// Output position at which to poll next; `usize::MAX` when no check is set.
+    next_at: usize,
+}
+
+impl<'a> CancelPoll<'a> {
+    fn new(check: Option<&'a dyn Fn() -> bool>, start_pos: usize) -> Self {
+        CancelPoll {
+            next_at: match check {
+                Some(_) => start_pos.saturating_add(CANCEL_CHECK_INTERVAL),
+                None => usize::MAX,
+            },
+            check,
+        }
+    }
+
+    /// Polls the check once `pos` reaches the next checkpoint. `true` = cancel.
+    #[inline]
+    fn reached(&mut self, pos: usize) -> bool {
+        if pos < self.next_at {
+            return false;
+        }
+        self.next_at = pos.saturating_add(CANCEL_CHECK_INTERVAL);
+        self.check.map_or(false, |check| check())
+    }
+
+    /// Polls the check unconditionally (used at block boundaries).
+    #[inline]
+    fn cancelled(&self) -> bool {
+        self.check.map_or(false, |check| check())
+    }
+}
+
 /// Fast inner decompression loop which is run  while there is at least
 /// 259 bytes left in the output buffer, and at least 6 bytes left in the input buffer
 /// (The maximum one match would need + 1).
@@ -1225,6 +1267,7 @@ fn decompress_fast(
     flags: u32,
     local_vars: &mut LocalVars,
     out_buf_size_mask: usize,
+    poll: &mut CancelPoll,
 ) -> (TINFLStatus, State) {
     // Make a local copy of the most used variables, to avoid having to update and read from values
     // in a random memory location and to encourage more register use.
@@ -1233,6 +1276,11 @@ fn decompress_fast(
 
     let status: TINFLStatus = 'o: loop {
         state = State::DecodeLitlen;
+
+        if poll.reached(out_buf.position()) {
+            break 'o TINFLStatus::Cancelled;
+        }
+
         loop {
             // This function assumes that there is at least 259 bytes left in the output buffer,
             // and that there is at least 14 bytes left in the input buffer. 14 input bytes:
@@ -1425,6 +1473,21 @@ pub fn decompress_with_limit(
     out_max: usize,
     flags: u32,
 ) -> (TINFLStatus, usize, usize) {
+    decompress_internal(r, in_buf, out, out_pos, out_max, flags, None)
+}
+
+/// Same as [`decompress_with_limit()`], but polls `cancel` at each block boundary and
+/// roughly every [`CANCEL_CHECK_INTERVAL`] output bytes in the fast path, ending
+/// decompression with [`TINFLStatus::Cancelled`] if it returns true.
+pub(crate) fn decompress_internal(
+    r: &mut DecompressorOxide,
+    in_buf: &[u8],
+    out: &mut [u8],
+    out_pos: usize,
+    out_max: usize,
+    flags: u32,
+    cancel: Option<&dyn Fn() -> bool>,
+) -> (TINFLStatus, usize, usize) {
     let out_buf_size_mask = if flags & TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF != 0 {
         usize::MAX
     } else {
@@ -1456,6 +1519,8 @@ pub fn decompress_with_limit(
         counter: r.counter,
         num_extra: r.num_extra,
     };
+
+    let mut poll = CancelPoll::new(cancel, out_pos);
 
     let mut status = 'state_machine: loop {
         match state {
@@ -1492,6 +1557,10 @@ pub fn decompress_with_limit(
 
             // Read the block header and jump to the relevant section depending on the block type.
             ReadBlockHeader => generate_state!(state, 'state_machine, {
+                // Poll the cancel check at each block boundary.
+                if poll.cancelled() {
+                    break 'state_machine TINFLStatus::Cancelled;
+                }
                 read_bits(&mut l, 3, &mut in_iter, flags, |l, bits| {
                     r.finish = (bits & 1) as u8;
                     r.block_type = ((bits >> 1) & 3) as u8;
@@ -1764,6 +1833,7 @@ pub fn decompress_with_limit(
                         flags,
                         &mut l,
                         out_buf_size_mask,
+                        &mut poll,
                     );
 
                     state = new_state;

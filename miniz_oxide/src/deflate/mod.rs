@@ -144,6 +144,84 @@ pub fn compress_to_vec_zlib(input: &[u8], level: u8) -> Vec<u8> {
     compress_to_vec_inner(input, level, 1, 0)
 }
 
+/// Error returned when [`compress_to_vec_with_cancel`] is cancelled by its check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressCancelled;
+
+impl ::core::fmt::Display for CompressCancelled {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.write_str("Cancelled by the cancel check")
+    }
+}
+
+#[cfg(feature = "std")]
+impl ::std::error::Error for CompressCancelled {}
+
+/// Compress the input data to a vector, using the specified compression level
+/// (0-10) and an optional zlib wrapper, polling `cancel` about every 64 KiB of
+/// consumed input.
+///
+/// If `cancel` signals cancellation, compression ends early with
+/// [`CompressCancelled`] and the data compressed so far is discarded.
+///
+/// [`NeverCancel`][crate::cancel::NeverCancel] never cancels and produces the
+/// same output as [`compress_to_vec`] / [`compress_to_vec_zlib`].
+pub fn compress_to_vec_with_cancel(
+    input: &[u8],
+    level: u8,
+    zlib_wrapper: bool,
+    cancel: &impl crate::cancel::CancelCheck,
+) -> Result<Vec<u8>, CompressCancelled> {
+    // The comp flags function sets the zlib flag if the window_bits parameter is > 0.
+    let flags = create_comp_flags_from_zip_params(level.into(), i32::from(zlib_wrapper), 0);
+    let mut compressor = CompressorOxide::new(flags);
+    let mut output = vec![0; ::core::cmp::max(input.len() / 2, 2)];
+
+    // Compression has no output amplification, so feeding the streaming
+    // compressor bounded input chunks bounds the work between polls. Block
+    // emission is driven by the compressor's internal buffers, not call
+    // boundaries, so the output matches the one-shot functions.
+    const CANCEL_CHUNK: usize = 64 * 1024;
+
+    let mut in_pos = 0;
+    let mut out_pos = 0;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(CompressCancelled);
+        }
+
+        let chunk_end = ::core::cmp::min(in_pos + CANCEL_CHUNK, input.len());
+        let last = chunk_end == input.len();
+        let (status, bytes_in, bytes_out) = compress(
+            &mut compressor,
+            &input[in_pos..chunk_end],
+            &mut output[out_pos..],
+            if last {
+                TDEFLFlush::Finish
+            } else {
+                TDEFLFlush::None
+            },
+        );
+        in_pos += bytes_in;
+        out_pos += bytes_out;
+
+        match status {
+            TDEFLStatus::Done => {
+                output.truncate(out_pos);
+                return Ok(output);
+            }
+            TDEFLStatus::Okay => {
+                // We may need more space, so resize the vector.
+                if output.len().saturating_sub(out_pos) < 30 {
+                    output.resize(output.len() * 2, 0)
+                }
+            }
+            // Not supposed to happen unless there is a bug.
+            _ => panic!("Bug! Unexpectedly failed to compress!"),
+        }
+    }
+}
+
 /// Simple function to compress data to a vec.
 fn compress_to_vec_inner(mut input: &[u8], level: u8, window_bits: i32, strategy: i32) -> Vec<u8> {
     // The comp flags function sets the zlib flag if the window_bits parameter is > 0.
@@ -258,5 +336,51 @@ mod test {
         // (The optimal compressed length would be 5, but neither miniz nor zlib manages that either
         // as neither checks matches against the byte at index 0.)
         assert!(c.len() <= 6);
+    }
+
+    mod cancel {
+        use crate::cancel::NeverCancel;
+        use crate::deflate::{
+            compress_to_vec_with_cancel, compress_to_vec_zlib, CompressCancelled,
+        };
+        use alloc::sync::Arc;
+        use alloc::vec::Vec;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Returns a check that cancels after `n` polls.
+        fn cancel_after(n: usize) -> impl Fn() -> bool + Send + Sync {
+            let remaining = Arc::new(AtomicUsize::new(n));
+            move || {
+                if remaining.load(Ordering::Relaxed) == 0 {
+                    true
+                } else {
+                    remaining.fetch_sub(1, Ordering::Relaxed);
+                    false
+                }
+            }
+        }
+
+        /// Spans several 64 KiB poll chunks.
+        fn payload() -> Vec<u8> {
+            (0..512 * 1024).map(|i| (i % 251) as u8).collect()
+        }
+
+        #[test]
+        fn never_cancelling_matches_plain_compress() {
+            let raw = payload();
+            let plain = compress_to_vec_zlib(&raw, 6);
+            let with_cancel = compress_to_vec_with_cancel(&raw, 6, true, &NeverCancel).unwrap();
+            assert_eq!(plain, with_cancel);
+        }
+
+        #[test]
+        fn cancelling_returns_error() {
+            let raw = payload();
+            for checks_allowed in [0, 2] {
+                let err = compress_to_vec_with_cancel(&raw, 6, true, &cancel_after(checks_allowed))
+                    .unwrap_err();
+                assert_eq!(err, CompressCancelled);
+            }
+        }
     }
 }

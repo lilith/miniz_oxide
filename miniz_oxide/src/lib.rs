@@ -28,6 +28,7 @@ fn roundtrip(data: &[u8]) {
 #[cfg(feature = "with-alloc")]
 extern crate alloc;
 
+pub mod cancel;
 #[cfg(feature = "with-alloc")]
 pub mod deflate;
 pub mod inflate;
